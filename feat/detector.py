@@ -1,4 +1,5 @@
 import json
+import logging
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
@@ -47,6 +48,8 @@ from torchvision.transforms import Compose, Normalize
 import sys
 import warnings
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 sys.modules["__main__"].__dict__["XGBClassifier"] = XGBClassifier
 sys.modules["__main__"].__dict__["SVMClassifier"] = SVMClassifier
@@ -589,20 +592,43 @@ class Detector(nn.Module, PyTorchModelHubMixin):
         frame_counter = 0
 
         try:
-            _ = next(enumerate(tqdm(data_loader)))
+            # Validate that batches can be created (single iteration test)
+            try:
+                next(iter(data_loader))
+            except StopIteration:
+                pass  # Empty dataset is OK for validation
         except RuntimeError as e:
             raise ValueError(
                 f"When using `batch_size > 1`, all images must either have the same dimension or `output_size` should be something other than `None` to pad images prior to processing\n{e}"
             )
 
+        import time
+        t_s = time.time()
         for batch_id, batch_data in enumerate(data_iterator):
+            t_e = time.time()
+            logger.info(
+                f"Data Loading Time for Batch {batch_id}: {t_e - t_s:.3f} seconds"
+            )
+
+            t_s = time.time()
             faces_data = self.detect_faces(
                 batch_data["Image"],
                 face_size=self.face_size if hasattr(self, "face_size") else 112,
                 face_detection_threshold=face_detection_threshold,
             )
-            batch_results = self.forward(faces_data)
+            t_e = time.time()
+            logger.info(
+                f"Face Detection Time for Batch {batch_id}: {t_e - t_s:.3f} seconds"
+            )
 
+            t_s = time.time()            
+            batch_results = self.forward(faces_data)
+            t_e = time.time()
+            logger.info(
+                f"Feature Detection Time for Batch {batch_id}: {t_e - t_s:.3f} seconds"
+            )
+
+            t_s = time.time()
             # Create metadata for each frame
             file_names = []
             frame_ids = []
@@ -616,67 +642,72 @@ class Detector(nn.Module, PyTorchModelHubMixin):
                 file_names.append(np.repeat(batch_data["FileName"][i], n_faces))
             batch_results["input"] = np.concatenate(file_names)
             batch_results["frame"] = np.concatenate(frame_ids)
+            
+            t_e = time.time()
+            logger.info(
+                f"Metadata Assignment Time for Batch {batch_id}: {t_e - t_s:.3f} seconds"
+            )
 
-            # Invert the face boxes and landmarks based on the padded output size
-            for j, frame_idx in enumerate(batch_results["frame"].unique()):
-                batch_results.loc[
-                    batch_results["frame"] == frame_idx, ["FrameHeight", "FrameWidth"]
-                ] = (
-                    compute_original_image_size(batch_data)[j, :]
-                    .repeat(
-                        len(
-                            batch_results.loc[
-                                batch_results["frame"] == frame_idx, "frame"
-                            ]
-                        ),
-                        1,
-                    )
-                    .numpy()
-                )
-                batch_results.loc[batch_results["frame"] == frame_idx, "FaceRectX"] = (
-                    batch_results.loc[batch_results["frame"] == frame_idx, "FaceRectX"]
-                    - batch_data["Padding"]["Left"].detach().numpy()[j]
-                ) / batch_data["Scale"].detach().numpy()[j]
-                batch_results.loc[batch_results["frame"] == frame_idx, "FaceRectY"] = (
-                    batch_results.loc[batch_results["frame"] == frame_idx, "FaceRectY"]
-                    - batch_data["Padding"]["Top"].detach().numpy()[j]
-                ) / batch_data["Scale"].detach().numpy()[j]
-                batch_results.loc[
-                    batch_results["frame"] == frame_idx, "FaceRectWidth"
-                ] = (
-                    (
-                        batch_results.loc[
-                            batch_results["frame"] == frame_idx, "FaceRectWidth"
-                        ]
-                    )
-                    / batch_data["Scale"].detach().numpy()[j]
-                )
-                batch_results.loc[
-                    batch_results["frame"] == frame_idx, "FaceRectHeight"
-                ] = (
-                    (
-                        batch_results.loc[
-                            batch_results["frame"] == frame_idx, "FaceRectHeight"
-                        ]
-                    )
-                    / batch_data["Scale"].detach().numpy()[j]
-                )
+            t_s = time.time()
+            # Invert the face boxes and landmarks based on the padded output size (vectorized)
+            unique_frames = batch_results["frame"].unique()
 
-                for i in range(68):
-                    batch_results.loc[batch_results["frame"] == frame_idx, f"x_{i}"] = (
-                        batch_results.loc[batch_results["frame"] == frame_idx, f"x_{i}"]
-                        - batch_data["Padding"]["Left"].detach().numpy()[j]
-                    ) / batch_data["Scale"].detach().numpy()[j]
-                    batch_results.loc[batch_results["frame"] == frame_idx, f"y_{i}"] = (
-                        batch_results.loc[batch_results["frame"] == frame_idx, f"y_{i}"]
-                        - batch_data["Padding"]["Top"].detach().numpy()[j]
-                    ) / batch_data["Scale"].detach().numpy()[j]
+            # Precompute per-frame values once
+            _sizes = compute_original_image_size(batch_data).detach().cpu().numpy()  # (B, 2) => [H, W]
+            _scales = batch_data["Scale"].detach().cpu().numpy()
+            _pad_left = batch_data["Padding"]["Left"].detach().cpu().numpy()
+            _pad_top = batch_data["Padding"]["Top"].detach().cpu().numpy()
+
+            n_frames = len(unique_frames)
+            # Map per-row frame attributes
+            fh_map = pd.Series(_sizes[:n_frames, 0], index=unique_frames)
+            fw_map = pd.Series(_sizes[:n_frames, 1], index=unique_frames)
+            scale_map = pd.Series(_scales[:n_frames], index=unique_frames)
+            padl_map = pd.Series(_pad_left[:n_frames], index=unique_frames)
+            padt_map = pd.Series(_pad_top[:n_frames], index=unique_frames)
+
+            batch_results["FrameHeight"] = batch_results["frame"].map(fh_map)
+            batch_results["FrameWidth"] = batch_results["frame"].map(fw_map)
+            batch_results["_scale"] = batch_results["frame"].map(scale_map)
+            batch_results["_padl"] = batch_results["frame"].map(padl_map)
+            batch_results["_padt"] = batch_results["frame"].map(padt_map)
+
+            # Adjust bbox columns
+            batch_results["FaceRectX"] = (
+                (batch_results["FaceRectX"] - batch_results["_padl"]) / batch_results["_scale"]
+            )
+            batch_results["FaceRectY"] = (
+                (batch_results["FaceRectY"] - batch_results["_padt"]) / batch_results["_scale"]
+            )
+            batch_results["FaceRectWidth"] = batch_results["FaceRectWidth"] / batch_results["_scale"]
+            batch_results["FaceRectHeight"] = batch_results["FaceRectHeight"] / batch_results["_scale"]
+
+            # Adjust landmark columns in a vectorized way
+            x_cols = [f"x_{i}" for i in range(68)]
+            y_cols = [f"y_{i}" for i in range(68)]
+            _x_adj = batch_results[x_cols].sub(batch_results["_padl"], axis=0)
+            _x_adj = _x_adj.div(batch_results["_scale"], axis=0)
+            batch_results[x_cols] = _x_adj
+
+            _y_adj = batch_results[y_cols].sub(batch_results["_padt"], axis=0)
+            _y_adj = _y_adj.div(batch_results["_scale"], axis=0)
+            batch_results[y_cols] = _y_adj
+
+            # Clean up temporary columns
+            batch_results.drop(columns=["_scale", "_padl", "_padt"], inplace=True)
+
+            t_e = time.time()
+            logger.info(
+                f"Post-processing Time for Batch {batch_id}: {t_e - t_s:.3f} seconds"
+            )
 
             if save:
                 batch_results.to_csv(save, mode="a", index=False, header=batch_id == 0)
             else:
                 batch_output.append(batch_results)
             frame_counter += 1 * batch_size
+            
+            t_s = time.time()
 
         batch_output = (
             Fex(
@@ -707,4 +738,5 @@ class Detector(nn.Module, PyTorchModelHubMixin):
         # Overwrite with approx_time and identity columns
         if save:
             batch_output.to_csv(save, mode="w", index=False)
+        
         return batch_output
